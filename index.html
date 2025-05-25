@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ChatApp</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        /* Custom scrollbar styling */
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 8px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background: #f1f1f1;
+            border-radius: 10px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background: #888;
+            border-radius: 10px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+            background: #555;
+        }
+    </style>
+</head>
+<body class="h-screen flex flex-col bg-gray-100">
+
+    <header class="bg-white p-4 shadow-md flex justify-between items-center rounded-b-lg">
+        <h1 class="text-3xl font-extrabold text-blue-700 tracking-tight">
+            <span class="text-green-500">Chat</span>App
+        </h1>
+        <div id="auth-status" class="flex items-center space-x-4">
+            </div>
+    </header>
+
+    <div id="main-content" class="flex flex-1 overflow-hidden p-4">
+        <div id="loading-spinner" class="flex items-center justify-center h-full w-full text-xl text-gray-700">
+            Loading authentication...
+        </div>
+    </div>
+
+    <script type="module">
+        // Import necessary Firebase modules
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, query, orderBy, onSnapshot, addDoc, serverTimestamp, doc, where, getDocs, updateDoc, arrayUnion } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global variables provided by the Canvas environment for Firebase configuration
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // Initialize Firebase App, Firestore, and Auth services
+        const app = initializeApp(firebaseConfig);
+        const db = getFirestore(app);
+        const auth = getAuth(app);
+
+        // Application state variables
+        let currentUser = null; // Stores the current authenticated user
+        let chats = []; // Stores the list of chats the user is a member of
+        let selectedChatId = null; // Stores the ID of the currently selected chat
+        let isAuthReady = false; // Flag to indicate if Firebase authentication has been initialized
+
+        // Unsubscribe functions for real-time listeners to clean them up when no longer needed
+        let unsubscribeChats = null;
+        let unsubscribeMessages = null;
+
+        // --- Helper Functions ---
+
+        /**
+         * Generates a random alphanumeric string of a given length.
+         * Used as a replacement for the 'nanoid' library.
+         * @param {number} length - The desired length of the generated ID.
+         * @returns {string} A unique alphanumeric string.
+         */
+        function generateNanoId(length) {
+            let result = '';
+            const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+            const charactersLength = characters.length;
+            for (let i = 0; i < length; i++) {
+                result += characters.charAt(Math.floor(Math.random() * charactersLength));
+            }
+            return result;
+        }
+
+        /**
+         * Scrolls a given HTML element to its bottom.
+         * @param {HTMLElement} element - The element to scroll.
+         */
+        function scrollToBottom(element) {
+            if (element) {
+                element.scrollTop = element.scrollHeight;
+            }
+        }
+
+        /**
+         * Displays a temporary message to the user in the UI.
+         * @param {string} message - The message text to display.
+         * @param {'info'|'success'|'error'} type - The type of message, influences styling.
+         */
+        function displayMessage(message, type = 'info') {
+            const messageDisplay = document.getElementById('message-display');
+            if (messageDisplay) {
+                messageDisplay.textContent = message;
+                // Apply Tailwind classes based on message type
+                messageDisplay.className = `mt-4 text-center text-sm font-medium p-2 rounded-md ${
+                    type === 'success' ? 'bg-green-100 text-green-700' :
+                    type === 'error' ? 'bg-red-100 text-red-700' :
+                    'bg-yellow-100 text-gray-700'
+                }`;
+                // Clear the message after 5 seconds
+                setTimeout(() => {
+                    messageDisplay.textContent = '';
+                    messageDisplay.className = ''; // Reset classes
+                }, 5000);
+            }
+        }
+
+        // --- Authentication Logic ---
+
+        /**
+         * Initializes Firebase authentication. Attempts to sign in with a custom token
+         * if available, otherwise signs in anonymously.
+         */
+        async function initAuth() {
+            try {
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Firebase authentication error:", error);
+                displayMessage("Authentication failed. Please try again.", "error");
+            } finally {
+                isAuthReady = true; // Mark authentication as ready
+                renderApp(); // Re-render the entire application based on the new auth state
+            }
+        }
+
+        /**
+         * Listens for changes in the Firebase authentication state.
+         * Updates the `currentUser` variable and re-renders the app accordingly.
+         * Also manages the chat list listener.
+         */
+        onAuthStateChanged(auth, (user) => {
+            currentUser = user;
+            console.log("Auth state changed. Current user:", user);
+            renderApp(); // Re-render the app to reflect login/logout status
+
+            // If a user is authenticated and auth is ready, set up the chat list listener
+            if (user && isAuthReady) {
+                setupChatListListener();
+            } else if (!user) {
+                // If user logs out or is not authenticated, clear chat data and listeners
+                chats = [];
+                selectedChatId = null;
+                if (unsubscribeChats) unsubscribeChats();
+                if (unsubscribeMessages) unsubscribeMessages();
+                renderApp(); // Re-render to show the "not authenticated" message
+            }
+        });
+
+        // --- Chat List and Create/Join Chat Logic ---
+
+        /**
+         * Handles the creation of a new chat.
+         * Generates a unique join code and adds the chat to Firestore.
+         */
+        async function createNewChat() {
+            const chatNameInput = document.getElementById('create-chat-name');
+            const chatName = chatNameInput.value.trim();
+
+            if (!chatName) {
+                displayMessage('Please enter a chat name.', 'error');
+                return;
+            }
+            if (!currentUser) {
+                displayMessage('You must be logged in to create a chat.', 'error');
+                return;
+            }
+
+            const newJoinCode = generateNanoId(6).toUpperCase();
+            try {
+                // Add a new document to the 'chats' collection in Firestore
+                const docRef = await addDoc(collection(db, `artifacts/${appId}/public/data/chats`), {
+                    name: chatName,
+                    members: [currentUser.uid], // Creator is the first member
+                    joinCode: newJoinCode,
+                    createdAt: serverTimestamp(), // Use Firestore's server timestamp
+                });
+                document.getElementById('generated-code-display').textContent = newJoinCode;
+                document.getElementById('generated-code-container').classList.remove('hidden'); // Show the generated code
+                chatNameInput.value = ''; // Clear the input field
+                displayMessage(`Chat "${chatName}" created! Share code: ${newJoinCode}`, 'success');
+                console.log('Chat created with ID:', docRef.id, 'and Join Code:', newJoinCode);
+                handleChatSelect(docRef.id); // Automatically select the newly created chat
+            } catch (e) {
+                console.error('Error adding document: ', e);
+                displayMessage('Error creating chat. Please try again.', 'error');
+            }
+        }
+
+        /**
+         * Handles joining an existing chat using a join code.
+         * Queries Firestore for the chat and adds the current user as a member.
+         */
+        async function joinExistingChat() {
+            const joinCodeInput = document.getElementById('join-chat-code');
+            const joinCode = joinCodeInput.value.trim();
+
+            if (!joinCode) {
+                displayMessage('Please enter a join code.', 'error');
+                return;
+            }
+            if (!currentUser) {
+                displayMessage('You must be logged in to join a chat.', 'error');
+                return;
+            }
+
+            try {
+                // Query the 'chats' collection for a chat with the matching join code
+                const q = query(collection(db, `artifacts/${appId}/public/data/chats`), where('joinCode', '==', joinCode.toUpperCase()));
+                const querySnapshot = await getDocs(q);
+
+                if (querySnapshot.empty) {
+                    displayMessage('No chat found with that code.', 'error');
+                    return;
+                }
+
+                const chatDoc = querySnapshot.docs[0];
+                const chatData = chatDoc.data();
+
+                // Check if the user is already a member of this chat
+                if (chatData.members.includes(currentUser.uid)) {
+                    displayMessage(`You are already a member of "${chatData.name}".`, 'info');
+                    handleChatSelect(chatDoc.id); // Select the chat if already a member
+                    return;
+                }
+
+                // Add the current user to the chat's members array using arrayUnion to prevent duplicates
+                await updateDoc(doc(db, `artifacts/${appId}/public/data/chats`, chatDoc.id), {
+                    members: arrayUnion(currentUser.uid)
+                });
+                displayMessage(`Successfully joined "${chatData.name}"!`, 'success');
+                joinCodeInput.value = ''; // Clear the input field
+                handleChatSelect(chatDoc.id); // Select the newly joined chat
+            } catch (error) {
+                console.error('Error joining chat:', error);
+                displayMessage('Error joining chat. Please try again.', 'error');
+            }
+        }
+
+        /**
+         * Sets the currently selected chat and triggers UI updates.
+         * @param {string} chatId - The ID of the chat to select.
+         */
+        function handleChatSelect(chatId) {
+            selectedChatId = chatId;
+            renderChatRoom(); // Re-render the chat room with messages for the selected chat
+            setupMessagesListener(); // Set up a new real-time listener for messages in this chat
+            renderChatList(); // Re-render the chat list to highlight the selected chat
+        }
+
+        /**
+         * Handles user logout.
+         * Signs out the current user and clears relevant application state.
+         */
+        async function handleLogout() {
+            try {
+                await signOut(auth);
+                // The onAuthStateChanged listener will handle clearing currentUser, chats, etc.
+                console.log("User logged out.");
+            } catch (error) {
+                console.error("Error logging out:", error);
+                displayMessage("Error logging out. Please try again.", "error");
+            }
+        }
+
+        // --- Message Sending/Receiving Logic ---
+
+        /**
+         * Handles sending a new message in the selected chat.
+         * @param {Event} e - The form submission event.
+         */
+        async function sendMessage(e) {
+            e.preventDefault(); // Prevent default form submission to avoid page reload
+            const messageInput = document.getElementById('message-input');
+            const messageText = messageInput.value.trim();
+
+            // Do not send empty messages or if no user/chat is selected
+            if (!messageText || !currentUser || !selectedChatId) return;
+
+            try {
+                // Add a new message document to the 'messages' subcollection of the selected chat
+                await addDoc(collection(db, `artifacts/${appId}/public/data/chats`, selectedChatId, 'messages'), {
+                    text: messageText,
+                    senderId: currentUser.uid,
+                    // Use display name, email, or a truncated UID as fallback for sender name
+                    senderName: currentUser.displayName || currentUser.email || `User ${currentUser.uid.substring(0, 6)}`,
+                    timestamp: serverTimestamp(), // Use Firestore's server timestamp
+                });
+                messageInput.value = ''; // Clear the input field after sending
+            } catch (error) {
+                console.error('Error sending message:', error);
+                displayMessage('Error sending message. Please try again.', 'error');
+            }
+        }
+
+        // --- Firestore Real-time Listeners ---
+
+        /**
+         * Sets up a real-time listener for the current user's chats.
+         * Updates the `chats` array and triggers UI re-rendering.
+         */
+        function setupChatListListener() {
+            // Unsubscribe from any previous listener to prevent memory leaks
+            if (unsubscribeChats) {
+                unsubscribeChats();
+            }
+            // If no user is authenticated or auth is not ready, clear chats and return
+            if (!currentUser || !isAuthReady) {
+                chats = [];
+                renderChatList();
+                return;
+            }
+
+            // Query for chats where the current user is a member
+            const q = query(collection(db, `artifacts/${appId}/public/data/chats`), where('members', 'array-contains', currentUser.uid));
+
+            // Set up the real-time listener using onSnapshot
+            unsubscribeChats = onSnapshot(q, (snapshot) => {
+                const userChats = [];
+                snapshot.forEach(doc => {
+                    userChats.push({ id: doc.id, ...doc.data() });
+                });
+                chats = userChats; // Update the global chats array
+                console.log("User chats updated:", chats);
+
+                // If no chat is currently selected, or the selected chat is no longer in the list,
+                // automatically select the first available chat.
+                if (!selectedChatId || !chats.some(chat => chat.id === selectedChatId)) {
+                    if (chats.length > 0) {
+                        selectedChatId = chats[0].id;
+                    } else {
+                        selectedChatId = null; // No chats available
+                    }
+                }
+                renderChatList(); // Re-render the chat list
+                renderChatRoom(); // Re-render the chat room (will trigger message listener if chat selected)
+            }, (error) => {
+                console.error("Error fetching user chats:", error);
+                displayMessage("Error loading chats.", "error");
+            });
+        }
+
+        /**
+         * Sets up a real-time listener for messages within the currently selected chat.
+         * Updates the messages display and scrolls to the bottom.
+         */
+        function setupMessagesListener() {
+            // Unsubscribe from any previous message listener
+            if (unsubscribeMessages) {
+                unsubscribeMessages();
+            }
+            // If no chat is selected, display a prompt and return
+            if (!selectedChatId) {
+                const messagesDisplay = document.getElementById('messages-display');
+                if (messagesDisplay) {
+                    messagesDisplay.innerHTML = `<div class="text-center text-gray-500 font-inter">Select a chat from the left panel to start messaging.</div>`;
+                }
+                return;
+            }
+
+            // Reference to the 'messages' subcollection of the selected chat
+            const messagesRef = collection(db, `artifacts/${appId}/public/data/chats`, selectedChatId, 'messages');
+            // Query messages ordered by timestamp for correct display order
+            const q = query(messagesRef, orderBy('timestamp', 'asc'));
+
+            // Set up the real-time listener
+            unsubscribeMessages = onSnapshot(q, (snapshot) => {
+                const msgs = [];
+                snapshot.forEach((doc) => {
+                    msgs.push({ id: doc.id, ...doc.data() });
+                });
+                renderMessages(msgs); // Render the fetched messages
+                // Scroll to the bottom of the messages display after rendering
+                const messagesDisplay = document.getElementById('messages-display');
+                if (messagesDisplay) {
+                    scrollToBottom(messagesDisplay);
+                }
+            }, (error) => {
+                console.error("Error fetching messages:", error);
+                displayMessage("Error loading messages.", "error");
+            });
+        }
+
+        // --- UI Rendering Functions ---
+
+        /**
+         * The main rendering function that updates the entire application UI
+         * based on the current authentication state.
+         */
+        function renderApp() {
+            const mainContent = document.getElementById('main-content');
+            const authStatusDiv = document.getElementById('auth-status');
+
+            // Clear previous content in main areas
+            mainContent.innerHTML = '';
+            authStatusDiv.innerHTML = '';
+
+            // Show loading spinner if authentication is not yet ready
+            if (!isAuthReady) {
+                mainContent.innerHTML = `
+                    <div class="flex items-center justify-center h-full w-full text-xl text-gray-700">
+                        Loading authentication...
+                    </div>
+                `;
+                return;
+            }
+
+            // If a user is authenticated, render the main chat interface
+            if (currentUser) {
+                authStatusDiv.innerHTML = `
+                    <span class="text-gray-700 text-sm md:text-base">
+                        Logged in as: <span class="font-semibold">${currentUser.displayName || currentUser.email || `User ID: ${currentUser.uid}`}</span>
+                    </span>
+                    <button id="logout-button" class="bg-red-500 text-white px-4 py-2 rounded-md hover:bg-red-600 transition duration-300 shadow-lg">
+                        Logout
+                    </button>
+                `;
+                // Attach logout event listener
+                document.getElementById('logout-button').addEventListener('click', handleLogout);
+
+                mainContent.innerHTML = `
+                    <div class="w-full md:w-1/3 lg:w-1/4 bg-white rounded-l-lg shadow-xl flex flex-col overflow-hidden">
+                        <div class="p-4 border-b border-gray-200 bg-blue-50">
+                            <h2 class="text-2xl font-bold text-gray-800">Your Chats</h2>
+                        </div>
+                        <ul id="chat-list" class="flex-1 overflow-y-auto custom-scrollbar">
+                            </ul>
+                        <div class="p-4 border-t border-gray-200 bg-blue-50">
+                            <div class="p-4 bg-gray-50 rounded-lg shadow-inner">
+                                <h2 class="text-xl font-semibold mb-4 text-gray-800">Chat Codes</h2>
+
+                                <div class="mb-6 p-4 bg-white rounded-lg shadow-md">
+                                    <h3 class="text-lg font-medium mb-3 text-gray-700">Create New Chat</h3>
+                                    <input
+                                        type="text"
+                                        id="create-chat-name"
+                                        placeholder="Enter Chat Name"
+                                        class="w-full p-3 border border-gray-300 rounded-md mb-3 focus:outline-none focus:ring-2 focus:ring-blue-500 font-inter"
+                                    />
+                                    <button
+                                        id="create-chat-button"
+                                        class="w-full bg-blue-600 text-white p-3 rounded-md hover:bg-blue-700 transition duration-300 shadow-lg font-inter"
+                                    >
+                                        Create Chat
+                                    </button>
+                                    <p id="generated-code-container" class="mt-4 text-center text-lg font-medium text-green-700 font-inter hidden">
+                                        Share this code: <span id="generated-code-display" class="font-bold tracking-wider text-xl"></span>
+                                    </p>
+                                </div>
+
+                                <div class="p-4 bg-white rounded-lg shadow-md">
+                                    <h3 class="text-lg font-medium mb-3 text-gray-700">Join Chat with Code</h3>
+                                    <input
+                                        type="text"
+                                        id="join-chat-code"
+                                        placeholder="Enter Join Code"
+                                        class="w-full p-3 border border-gray-300 rounded-md mb-3 focus:outline-none focus:ring-2 focus:ring-green-500 font-inter"
+                                    />
+                                    <button
+                                        id="join-chat-button"
+                                        class="w-full bg-green-600 text-white p-3 rounded-md hover:bg-green-700 transition duration-300 shadow-lg font-inter"
+                                    >
+                                        Join Chat
+                                    </button>
+                                </div>
+
+                                <p id="message-display" class=""></p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="flex-1 bg-white rounded-r-lg shadow-xl flex flex-col">
+                        <div id="chat-room-content" class="flex flex-col h-full bg-gray-50 border-l border-gray-200 shadow-inner">
+                            </div>
+                    </div>
+                `;
+                // Attach event listeners for the create and join chat buttons
+                document.getElementById('create-chat-button').addEventListener('click', createNewChat);
+                document.getElementById('join-chat-button').addEventListener('click', joinExistingChat);
+
+                // Initial rendering of chat list and chat room content
+                renderChatList();
+                renderChatRoom();
+            } else {
+                // If no user is authenticated, display a welcome message
+                authStatusDiv.innerHTML = `<p class="text-gray-500">Not authenticated</p>`;
+                mainContent.innerHTML = `
+                    <div class="flex-1 flex flex-col items-center justify-center text-center p-8">
+                        <p class="text-2xl text-gray-600 mb-4 font-inter">
+                            Welcome! Please log in to start chatting.
+                        </p>
+                        <p class="text-md text-gray-500 font-inter">
+                            (Authentication is handled automatically for this demo, but in a real app, you'd have login/signup buttons here.)
+                        </p>
+                    </div>
+                `;
+            }
+        }
+
+        /**
+         * Renders the list of chats in the left panel.
+         * Highlights the currently selected chat.
+         */
+        function renderChatList() {
+            const chatListUl = document.getElementById('chat-list');
+            if (!chatListUl) return; // Exit if the chat list element is not found
+
+            chatListUl.innerHTML = ''; // Clear existing list items
+
+            if (chats.length === 0) {
+                chatListUl.innerHTML = `<p class="p-4 text-gray-500 text-center">No chats joined yet.</p>`;
+                return;
+            }
+
+            // Iterate through the chats array and create list items for each chat
+            chats.forEach(chat => {
+                const listItem = document.createElement('li');
+                listItem.className = `p-4 border-b border-gray-100 cursor-pointer hover:bg-gray-50 transition duration-150 ease-in-out ${
+                    selectedChatId === chat.id ? 'bg-blue-100 border-l-4 border-blue-500' : '' // Highlight selected chat
+                }`;
+                listItem.innerHTML = `
+                    <h3 class="font-medium text-lg text-gray-800">${chat.name || 'Unnamed Chat'}</h3>
+                    <p class="text-sm text-gray-500">Members: ${chat.members?.length || 0}</p>
+                    <p class="text-xs text-gray-400">ID: ${chat.id}</p> `;
+                // Attach click event listener to select the chat
+                listItem.addEventListener('click', () => handleChatSelect(chat.id));
+                chatListUl.appendChild(listItem);
+            });
+        }
+
+        /**
+         * Renders the chat room interface, including the message display area and input form.
+         */
+        function renderChatRoom() {
+            const chatRoomContent = document.getElementById('chat-room-content');
+            if (!chatRoomContent) return;
+
+            // If no chat is selected, display a prompt
+            if (!selectedChatId) {
+                chatRoomContent.innerHTML = `
+                    <div class="flex items-center justify-center h-full bg-gray-50 text-gray-500 text-lg font-inter">
+                        Select a chat from the left panel to start messaging.
+                    </div>
+                `;
+                return;
+            }
+
+            // Render the chat room structure
+            chatRoomContent.innerHTML = `
+                <div id="messages-display" class="flex-1 overflow-y-auto p-4 space-y-3 custom-scrollbar">
+                    </div>
+
+                <form id="message-form" class="p-4 bg-white border-t border-gray-200 flex items-center shadow-lg">
+                    <input
+                        type="text"
+                        id="message-input"
+                        placeholder="Type a message..."
+                        class="flex-1 p-3 border border-gray-300 rounded-full focus:outline-none focus:ring-2 focus:ring-blue-400 font-inter"
+                    />
+                    <button
+                        type="submit"
+                        class="ml-3 bg-blue-600 text-white p-3 rounded-full hover:bg-blue-700 transition duration-300 flex items-center justify-center shadow-xl"
+                    >
+                        <svg
+                            xmlns="http://www.w3.org/2000/svg"
+                            class="h-6 w-6"
+                            fill="none"
+                            viewBox="0 0 24 24"
+                            stroke="currentColor"
+                        >
+                            <path
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                strokeWidth={2}
+                                d="M14 5l7 7m0 0l-7 7m7-7H3"
+                            />
+                        </svg>
+                    </button>
+                </form>
+            `;
+            // Attach the submit event listener to the message form
+            document.getElementById('message-form').addEventListener('submit', sendMessage);
+            // Initial call to renderMessages (it will be empty until messages are fetched by listener)
+            renderMessages([]);
+        }
+
+        /**
+         * Renders individual messages within the chat room's message display area.
+         * @param {Array<Object>} messages - An array of message objects to render.
+         */
+        function renderMessages(messages) {
+            const messagesDisplay = document.getElementById('messages-display');
+            if (!messagesDisplay) return;
+
+            messagesDisplay.innerHTML = ''; // Clear existing messages
+
+            // Display a prompt if there are no messages
+            if (messages.length === 0) {
+                messagesDisplay.innerHTML = `<div class="text-center text-gray-500 font-inter">No messages yet. Start the conversation!</div>`;
+                return;
+            }
+
+            // Iterate through messages and create HTML elements for each
+            messages.forEach(msg => {
+                const messageDiv = document.createElement('div');
+                // Align messages to the right for the current user, left for others
+                messageDiv.className = `flex ${msg.senderId === currentUser.uid ? 'justify-end' : 'justify-start'}`;
+
+                const messageBubble = document.createElement('div');
+                messageBubble.className = `max-w-[70%] px-4 py-2 rounded-xl shadow-md font-inter ${
+                    msg.senderId === currentUser.uid
+                        ? 'bg-blue-600 text-white rounded-br-none' // Current user's message style
+                        : 'bg-white text-gray-800 rounded-bl-none' // Other users' message style
+                }`;
+
+                const senderName = document.createElement('p');
+                senderName.className = 'font-semibold text-sm mb-1';
+                senderName.textContent = msg.senderName;
+
+                const messageText = document.createElement('p');
+                messageText.className = 'text-base break-words';
+                messageText.textContent = msg.text;
+
+                const timestamp = document.createElement('p');
+                timestamp.className = 'text-xs text-right opacity-80 mt-1';
+                // Convert Firestore Timestamp to a readable time string
+                if (msg.timestamp && msg.timestamp.toDate) {
+                    timestamp.textContent = new Date(msg.timestamp.toDate()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                } else if (msg.timestamp) { // Fallback for plain JS Date or other timestamp formats
+                    timestamp.textContent = new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                }
+
+                // Append elements to the message bubble
+                messageBubble.appendChild(senderName);
+                messageBubble.appendChild(messageText);
+                if (msg.timestamp) { // Only append timestamp if it exists
+                    messageBubble.appendChild(timestamp);
+                }
+                messageDiv.appendChild(messageBubble);
+                messagesDisplay.appendChild(messageDiv);
+            });
+            // Scroll to the bottom of the messages display after all messages are rendered
+            scrollToBottom(messagesDisplay);
+        }
+
+        // --- Initialize Application on DOMContentLoaded ---
+        // This ensures the DOM is fully loaded before attempting to initialize Firebase and render the app.
+        document.addEventListener('DOMContentLoaded', () => {
+            initAuth(); // Start the authentication process
+        });
+
+    </script>
+</body>
+</html>
